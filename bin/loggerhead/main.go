@@ -1,15 +1,13 @@
 package main
 
 import (
-	"database/sql"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 
-	_ "github.com/lib/pq"
-
+	as "github.com/aerospike/aerospike-client-go"
 	"github.com/bifurcation/loggerhead"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -39,12 +37,12 @@ func main() {
 	flag.StringVar(&port, "port", "8080", "Port")
 	flag.Parse()
 
-	db, err := sql.Open("postgres", conn)
+	client, err := as.NewClient("127.0.0.1", 3000)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error opening DB: %v", err)
+		fmt.Fprintf(os.Stderr, "Error connecting to Aerospike server: %v", err)
 	}
 
-	handler := &loggerhead.LogHandler{DB: db}
+	handler := &loggerhead.LogHandler{Client: client}
 
 	http.Handle("/metrics", promhttp.Handler())
 	http.Handle("/ct/v1/add-chain", handler)

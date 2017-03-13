@@ -1,7 +1,6 @@
 package loggerhead
 
 import (
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -11,12 +10,8 @@ import (
 	"sync"
 	"time"
 
+	as "github.com/aerospike/aerospike-client-go"
 	"github.com/prometheus/client_golang/prometheus"
-)
-
-const (
-	frontierSelectQ = "SELECT frontier FROM certificates ORDER BY tree_size DESC LIMIT 1;"
-	certInsertQ     = "INSERT INTO certificates VALUES ($1, $2, $3, $4);"
 )
 
 // Prometheus metrics
@@ -60,33 +55,12 @@ func init() {
 }
 
 type LogHandler struct {
-	DB     *sql.DB
+	Client *as.Client
 	dbLock sync.Mutex
 }
 
 type addChainRequest struct {
 	Chain []string `json:"chain"`
-}
-
-func readfrontier(tx *sql.Tx) (*frontier, error) {
-	f := frontier{}
-
-	var buf []byte
-	err := tx.QueryRow(frontierSelectQ).Scan(&buf)
-	switch err {
-	case sql.ErrNoRows:
-		return &f, nil
-	case nil:
-		err = f.Unmarshal(buf)
-		return &f, err
-	default:
-		return nil, err
-	}
-}
-
-func logCertificate(tx *sql.Tx, timestamp, treeSize int64, frontier, cert []byte) error {
-	_, err := tx.Exec(certInsertQ, timestamp, treeSize, frontier, cert)
-	return err
 }
 
 var (
@@ -101,6 +75,8 @@ var (
 	outcomeWriteFrontierErr = "write-frontier-err"
 	outcomeTxCommitErr      = "tx-commit-err"
 	outcomeSuccess          = "success"
+	couldNotLockDB          = "could-not-lock-db"
+	outcomeLogFrontierErr   = "write-frontier-err"
 
 	responseValues = map[string]struct {
 		Status  int
@@ -119,6 +95,82 @@ var (
 		outcomeSuccess:          {http.StatusOK, "success: %v"},
 	}
 )
+
+// two "tables"
+//
+// 1. certificates{treeSize int [key] -> certificate []byte, frontier []byte}
+//
+//    This is the master table and the only one that truly needs to remain consistent.
+//    Everytime we get a new certificate, we append a record to the table. The database
+//    maintains consistency because there is key-level atomicity (which we can enforce
+//    same treeSize. If anything goes horribly astray, we restore cluster state based
+//    on the last record in this table. This requires a map reduce, but meh, it really
+//    shouldn't ever happen except on server boot, or if a failure somewhere
+//    (e.g., power loss between writing to certificates and the frontier)
+//
+// 1. frontier{id int [key](always 1) -> locked bool, lockedAt datetime, frontier []byte}
+//
+//    Unfortunately, if we only relied on this this constraint, there'd potentially
+//    be a *ton* of contention between multiple frontend servers. To prevent this,
+//	  we have a second helper table that contains the "frontier" and tree size. We
+//    write to this *after* we write to certificates and this write is *not* inside
+//    of a transaction. Therefore, it's possible for this table to enter a stale state.
+//    When this happens, we have to refresh it based on what's in the certificates table
+
+func (lh *LogHandler) readFrontier() (frontier, uint32, error) {
+	// set lock bit in frontier table. if cannot set, keep trying using exponential
+	// backoff. If we can't get a lock in 10 seconds, something is probably wrong, give up.
+	// once lock is achieved, figure out what treeSize slot we can use.
+	key, err := as.NewKey("ct", "frontier", 0)
+	if err != nil {
+		panic(err)
+	}
+	readPolicy := as.NewPolicy()
+	writePolicy := as.NewWritePolicy(0, 0)
+	writePolicy.GenerationPolicy = as.EXPECT_GEN_EQUAL
+	var rec *as.Record
+	for {
+		rec, err := lh.Client.Get(readPolicy, key)
+		if err != nil {
+			panic(err)
+		}
+		if rec != nil && rec.Bins["locked"].(int) != 0 {
+			continue
+		}
+		// woo! we're not locked! lock database.
+		writePolicy.Generation = rec.Generation
+		bin := as.NewBin("locked", 1)
+		lh.Client.PutBins(writePolicy, key, bin)
+	}
+	f := frontier{}
+	if rec != nil {
+		err = f.Unmarshal(rec.Bins["frontier"].([]byte))
+	}
+	return f, rec.Generation, err
+}
+
+func (lh *LogHandler) logCertificate(timestamp int64, treeSize int64, cert []byte, f frontier) error {
+	writePolicy := as.NewWritePolicy(0, 0)
+	// make sure we don't ever overwrite an existing record due to a lock failure.
+	// this is an append only data structure.
+	writePolicy.RecordExistsAction = as.CREATE_ONLY
+	certBin := as.NewBin("certificate", cert)
+	frontBin := as.NewBin("frontier", f.Marshal())
+	key, err := as.NewKey("ct", "frontier", treeSize)
+	err = lh.Client.PutBins(writePolicy, key, certBin, frontBin)
+	return err
+}
+
+func (lh *LogHandler) logFrontier(f frontier, generation uint32) error {
+	writePolicy := as.NewWritePolicy(0, 0)
+	writePolicy.GenerationPolicy = as.EXPECT_GEN_EQUAL
+	writePolicy.Generation = generation
+	frontBin := as.NewBin("frontier", f.Marshal())
+	lockBin := as.NewBin("locked", 0)
+	key, err := as.NewKey("ct", "frontier", 0)
+	err = lh.Client.PutBins(writePolicy, key, frontBin, lockBin)
+	return err
+}
 
 func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
 	outcome := outcomeSuccess
@@ -150,26 +202,23 @@ func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		outcome = outcomeBodyReadErr
 		return
 	}
-
 	ctRequest := addChainRequest{}
 	err = json.Unmarshal(body, &ctRequest)
 	if err != nil {
 		outcome = outcomeJSONParseErr
 		return
 	}
-
 	if len(ctRequest.Chain) == 0 {
 		outcome = outcomeEmptyChainErr
 		return
 	}
-
 	cert, err := base64.StdEncoding.DecodeString(ctRequest.Chain[0])
 	if err != nil {
 		outcome = outcomeBase64DecodeErr
 		return
 	}
 
-	// Await access to the DB
+	// Await access to the DB (local per-process lock only)
 	gotLock := make(chan bool, 1)
 	cancelled := make(chan bool, 1)
 	go func() {
@@ -189,12 +238,6 @@ func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	}
 	defer lh.dbLock.Unlock()
 
-	tx, err := lh.DB.Begin()
-	if err != nil {
-		outcome = outcomeTxBeginErr
-		return
-	}
-
 	enterTx := float64(time.Now().UnixNano()) / 1000000000.0
 	defer func() {
 		exitTx := float64(time.Now().UnixNano()) / 1000000000.0
@@ -202,36 +245,30 @@ func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Requ
 	}()
 
 	// Get the frontier from the DB
-	f, err := readfrontier(tx)
+	f, gen, err := lh.readFrontier()
 	if err != nil {
-		tx.Rollback()
 		outcome = outcomeReadFrontierErr
 		return
 	}
-
 	// Update the frontier with this certificate
 	enterUpdate := float64(time.Now().UnixNano()) / 1000000000.0
 	f.Add(cert)
 	treeSize = int64(f.Size())
 	exitUpdate := float64(time.Now().UnixNano()) / 1000000000.0
 	updateTime.Observe(exitUpdate - enterUpdate)
-
 	// Log the certificate
 	timestamp := time.Now().Unix()
-	err = logCertificate(tx, timestamp, treeSize, f.Marshal(), cert)
+	err = lh.logCertificate(timestamp, treeSize, cert, f)
 	if err != nil {
-		tx.Rollback()
 		outcome = outcomeLogCertErr
 		return
 	}
-
-	// Commit the changes
-	err = tx.Commit()
+	// Log frontier
+	err = lh.logFrontier(f, gen)
 	if err != nil {
-		tx.Rollback()
-		outcome = outcomeTxCommitErr
+		outcome = outcomeLogFrontierErr
 		return
 	}
-
+	// Commit the changes
 	outcome = outcomeSuccess
 }
