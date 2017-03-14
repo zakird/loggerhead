@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+        "sync"
 
 	as "github.com/aerospike/aerospike-client-go"
 	"github.com/bifurcation/loggerhead"
@@ -41,8 +42,9 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error connecting to Aerospike server: %v", err)
 	}
+	var m sync.Mutex
 
-	handler := &loggerhead.LogHandler{Client: client}
+	handler := &loggerhead.LogHandler{Client: client, Mutex: &m}
 
 	http.Handle("/metrics", promhttp.Handler())
 	http.Handle("/ct/v1/add-chain", handler)

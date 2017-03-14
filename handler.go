@@ -14,6 +14,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+var (
+
+	frontierName = "f4"
+	certificatesName = "c4"
+	// store frontier in database or in local memory
+	localFrontier = true
+	frontierCache frontier
+)
+
+
+
+
 // Prometheus metrics
 var (
 	// Outcomes of logging requests
@@ -56,7 +68,7 @@ func init() {
 
 type LogHandler struct {
 	Client *as.Client
-	dbLock sync.Mutex
+	Mutex *sync.Mutex
 }
 
 type addChainRequest struct {
@@ -121,7 +133,12 @@ func (lh *LogHandler) readFrontier() (frontier, uint32, error) {
 	// set lock bit in frontier table. if cannot set, keep trying using exponential
 	// backoff. If we can't get a lock in 10 seconds, something is probably wrong, give up.
 	// once lock is achieved, figure out what treeSize slot we can use.
-	key, err := as.NewKey("ct", "frontier", 0)
+	//fmt.Println("read frontier called")
+	if localFrontier {
+		return frontierCache, 0, nil
+	}
+	// otherwise go get it from the database
+	key, err := as.NewKey("ctmem", frontierName, 0)
 	if err != nil {
 		panic(err)
 	}
@@ -130,49 +147,77 @@ func (lh *LogHandler) readFrontier() (frontier, uint32, error) {
 	writePolicy.GenerationPolicy = as.EXPECT_GEN_EQUAL
 	var rec *as.Record
 	for {
-		rec, err := lh.Client.Get(readPolicy, key)
+		//fmt.Println("in loop")
+		rec, err = lh.Client.Get(readPolicy, key)
 		if err != nil {
 			panic(err)
 		}
+		//fmt.Println("current state of frontier:", rec)
 		if rec != nil && rec.Bins["locked"].(int) != 0 {
+			//fmt.Println("locked")
 			continue
 		}
 		// woo! we're not locked! lock database.
-		writePolicy.Generation = rec.Generation
+		//fmt.Println("got frontier:", rec)
+		if rec != nil {
+			//fmt.Println("existing frontier")
+			writePolicy.Generation = rec.Generation
+		} else {
+			//fmt.Println("no existing frontier")
+			writePolicy.Generation = 0
+		}
 		bin := as.NewBin("locked", 1)
-		lh.Client.PutBins(writePolicy, key, bin)
+		err := lh.Client.PutBins(writePolicy, key, bin)
+		if err != nil {
+			continue
+		}
+		break;
 	}
 	f := frontier{}
+	//fmt.Println("got lock", f)
 	if rec != nil {
+		//fmt.Println("will try to decode")
 		err = f.Unmarshal(rec.Bins["frontier"].([]byte))
+		if err != nil{
+			panic("could not decode frontier")
+		}
+		//fmt.Println("got the following frontier", f)
+		return f, rec.Generation, err
 	}
-	return f, rec.Generation, err
+	return f, 0, err
 }
 
 func (lh *LogHandler) logCertificate(timestamp int64, treeSize int64, cert []byte, f frontier) error {
+	//fmt.Println("going to log certificate at", treeSize)
 	writePolicy := as.NewWritePolicy(0, 0)
 	// make sure we don't ever overwrite an existing record due to a lock failure.
 	// this is an append only data structure.
 	writePolicy.RecordExistsAction = as.CREATE_ONLY
 	certBin := as.NewBin("certificate", cert)
 	frontBin := as.NewBin("frontier", f.Marshal())
-	key, err := as.NewKey("ct", "frontier", treeSize)
+	key, err := as.NewKey("ct", certificatesName, treeSize)
 	err = lh.Client.PutBins(writePolicy, key, certBin, frontBin)
 	return err
 }
 
 func (lh *LogHandler) logFrontier(f frontier, generation uint32) error {
+	if localFrontier {
+		frontierCache = f
+	}
 	writePolicy := as.NewWritePolicy(0, 0)
-	writePolicy.GenerationPolicy = as.EXPECT_GEN_EQUAL
-	writePolicy.Generation = generation
+	//writePolicy.GenerationPolicy = as.EXPECT_GEN_EQUAL
+	//writePolicy.Generation = generation
+	//fmt.Println("going to log following frontier", f)
+	key, err := as.NewKey("ctmem", frontierName, 0)
 	frontBin := as.NewBin("frontier", f.Marshal())
 	lockBin := as.NewBin("locked", 0)
-	key, err := as.NewKey("ct", "frontier", 0)
 	err = lh.Client.PutBins(writePolicy, key, frontBin, lockBin)
+	//fmt.Println("released lock")
 	return err
 }
 
 func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	//fmt.Println("start")
 	outcome := outcomeSuccess
 	err := error(nil)
 	treeSize := int64(0)
@@ -217,26 +262,27 @@ func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		outcome = outcomeBase64DecodeErr
 		return
 	}
-
+	lh.Mutex.Lock()
+	defer lh.Mutex.Unlock()
 	// Await access to the DB (local per-process lock only)
-	gotLock := make(chan bool, 1)
-	cancelled := make(chan bool, 1)
-	go func() {
-		lh.dbLock.Lock()
-		gotLock <- true
-		if <-cancelled {
-			lh.dbLock.Unlock()
-		}
-	}()
+	//gotLock := make(chan bool, 1)
+	//cancelled := make(chan bool, 1)
+	//go func() {
+	//	lh.dbLock.Lock()
+	//	gotLock <- true
+	//	if <-cancelled {
+	//		lh.dbLock.Unlock()
+	//	}
+	//}()
 
-	select {
-	case <-gotLock:
-	case <-time.After(500 * time.Millisecond):
-		cancelled <- true
-		outcome = outcomeDBLockTimeout
-		return
-	}
-	defer lh.dbLock.Unlock()
+	//select {
+	//case <-gotLock:
+	//case <-time.After(500 * time.Millisecond):
+	//	cancelled <- true
+	//	outcome = outcomeDBLockTimeout
+	//	return
+	//}
+	//defer lh.dbLock.Unlock()
 
 	enterTx := float64(time.Now().UnixNano()) / 1000000000.0
 	defer func() {
@@ -250,15 +296,19 @@ func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		outcome = outcomeReadFrontierErr
 		return
 	}
+	//fmt.Println("read frontier")
 	// Update the frontier with this certificate
 	enterUpdate := float64(time.Now().UnixNano()) / 1000000000.0
+	//fmt.Println("old tree size", f.Size())
 	f.Add(cert)
 	treeSize = int64(f.Size())
+	//fmt.Println("new tree size", treeSize)
 	exitUpdate := float64(time.Now().UnixNano()) / 1000000000.0
 	updateTime.Observe(exitUpdate - enterUpdate)
 	// Log the certificate
 	timestamp := time.Now().Unix()
 	err = lh.logCertificate(timestamp, treeSize, cert, f)
+	//fmt.Println("logged cert")
 	if err != nil {
 		outcome = outcomeLogCertErr
 		return
@@ -269,6 +319,7 @@ func (lh *LogHandler) ServeHTTP(response http.ResponseWriter, request *http.Requ
 		outcome = outcomeLogFrontierErr
 		return
 	}
+	//fmt.Println("logged frontier")
 	// Commit the changes
 	outcome = outcomeSuccess
 }
