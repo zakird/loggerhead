@@ -15,16 +15,12 @@ import (
 )
 
 var (
-
-	frontierName = "f4"
+	frontierName     = "f4"
 	certificatesName = "c4"
 	// store frontier in database or in local memory
 	localFrontier = true
 	frontierCache frontier
 )
-
-
-
 
 // Prometheus metrics
 var (
@@ -68,7 +64,7 @@ func init() {
 
 type LogHandler struct {
 	Client *as.Client
-	Mutex *sync.Mutex
+	Mutex  *sync.Mutex
 }
 
 type addChainRequest struct {
@@ -112,22 +108,35 @@ var (
 //
 // 1. certificates{treeSize int [key] -> certificate []byte, frontier []byte}
 //
-//    This is the master table and the only one that truly needs to remain consistent.
-//    Everytime we get a new certificate, we append a record to the table. The database
-//    maintains consistency because there is key-level atomicity (which we can enforce
-//    same treeSize. If anything goes horribly astray, we restore cluster state based
-//    on the last record in this table. This requires a map reduce, but meh, it really
-//    shouldn't ever happen except on server boot, or if a failure somewhere
-//    (e.g., power loss between writing to certificates and the frontier)
+//    This is the master table and the only one that truly needs to remain
+//    consistent. Everytime we get a new certificate, we append a record to the
+//    table by inserting a record at the given treeSize. This will remain
+//    consistent because aerospike provides record-level atomicity and will
+//    prevent updates (versus an insert). As such, we should never have the
+//    possibility of trying to add two certificates at the same treeSize.
 //
-// 1. frontier{id int [key](always 1) -> locked bool, lockedAt datetime, frontier []byte}
+//	  Optimally, there would be a way to get the latest treeSize out of this
+//	  table, however, this doesn't seem possible without an expensive map
+//	  reduce. So, we need to cache this somewhere. Note, that it's "ok" if the
+//	  cacheTable is behind--- it can just never be head of the certificates
+//	  table. The worst case scenario if the cache table is behind is that the
+//	  write to certificates table fails, we realize that something is astray,
+//	  run the map reduce, and repopulate the cache table. If the cache table
+//	  somehow got ahead of the certificates table, we're screwed, but it seems
+//	  like this is easily preventable by just always writing to the
+//	  certificates table and making sure that that write is persisted before
+//	  ever writing to the cache table.
+
+// 2. frontier{id int [key](always 1) -> locked bool, lockedAt datetime, frontier []byte}
 //
-//    Unfortunately, if we only relied on this this constraint, there'd potentially
-//    be a *ton* of contention between multiple frontend servers. To prevent this,
-//	  we have a second helper table that contains the "frontier" and tree size. We
-//    write to this *after* we write to certificates and this write is *not* inside
-//    of a transaction. Therefore, it's possible for this table to enter a stale state.
-//    When this happens, we have to refresh it based on what's in the certificates table
+//    This table contains a cache of the latest frontier and treeSize. If there's a crash
+//    between a write to certificates and a write to this table, this table *can* enter an
+//    inconsistent state. In this situation, we have to do a map reduce over certificates
+//    to recalculate it. It's easy to determine whether this has happened, because it will
+//    result in a failed write to the certificates table.
+//
+//    This table doesn't need to exist in the database persay, it could also be in a faster
+//    shared in memory datastore, e.g., memcached or redis
 
 func (lh *LogHandler) readFrontier() (frontier, uint32, error) {
 	// set lock bit in frontier table. if cannot set, keep trying using exponential
@@ -171,14 +180,14 @@ func (lh *LogHandler) readFrontier() (frontier, uint32, error) {
 		if err != nil {
 			continue
 		}
-		break;
+		break
 	}
 	f := frontier{}
 	//fmt.Println("got lock", f)
 	if rec != nil {
 		//fmt.Println("will try to decode")
 		err = f.Unmarshal(rec.Bins["frontier"].([]byte))
-		if err != nil{
+		if err != nil {
 			panic("could not decode frontier")
 		}
 		//fmt.Println("got the following frontier", f)
